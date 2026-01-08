@@ -92,6 +92,24 @@ Planning guidance:
 - Make this feel like a real day plan: morning / midday / afternoon / evening with minimal backtracking.
 - Acount for constants like breakfast in the morning, lunch midday, dinner in the afternoon, drinks at night.
 - Put critical nuance (why this place, reservation needed, best time, proximity logic) in notes.
+- Time assignment (default times)
+- If the user explicitly provides times, use them.
+- Otherwise, assign sensible default times for activities to make the day feel scheduled.
+- Use local time for the destination. If you cannot determine the exact date, still set times (the app can adjust) or leave null if truly uncertain.
+- Use these default time windows unless the prompt suggests otherwise:
+  - Sunrise / beach walk / morning workout: startTime 07:30, endTime 09:00
+  - Breakfast / cafe: 09:00–10:00
+  - Museum / sightseeing / neighborhood walk: 10:00–12:00
+  - Lunch: 12:30–13:45
+  - Beach / relaxation / pool time: 14:00–16:30
+  - Coffee / snack break: 16:30–17:15
+  - Sunset viewpoint: 30 minutes before local sunset (if unknown, use 18:30–19:15)
+  - Dinner: 19:30–21:00
+  - Nightlife / bars / show: 21:30–23:30
+- Keep travel reasonable: leave 15–30 minutes between clusters for transit. If switching neighborhoods, add a gap.
+- For flights:
+  - If departure/arrival times are provided, set startTime/endTime.
+  - If only a single time is provided, use it as startTime and leave endTime null unless duration is known.
 
 Now produce the JSON.
 `;
