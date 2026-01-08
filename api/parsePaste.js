@@ -81,14 +81,16 @@ Rules for the JSON:
 - confidence must be 0.0–1.0.
 - sourceSnippet must contain the key phrase(s) from the user prompt that caused the item to exist (or a short summary if the prompt is broad).
 - Do not output markdown, code fences, or extra keys.
+- For any recommendation that is a specific place (restaurant/cafe/museum/park), set location to a geocodable venue string. Do not set location to only a broad area like ‘Downtown Toronto’ unless the activity is intentionally an area-based activity (e.g., ‘Walk through Downtown Toronto’).
 
 Planning guidance:
 - Unless the user asks otherwise, generate:
-  - 6–10 activities
-  - exactly 1 checklist (5–12 lines in checklistItemsText)
+  - 5–10 activities
+  - 0 or 1 checklist (5–12 lines in checklistItemsText) if it is relevant based on the prompt
   - 0–3 reminders
-  - 0–1 flight (only if the prompt indicates a flight)
+  - 0–3 flights (only if the prompt indicates a flight)
 - Make this feel like a real day plan: morning / midday / afternoon / evening with minimal backtracking.
+- Acount for constants like breakfast in the morning, lunch midday, dinner in the afternoon, drinks at night.
 - Put critical nuance (why this place, reservation needed, best time, proximity logic) in notes.
 
 Now produce the JSON.
