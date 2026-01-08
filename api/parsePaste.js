@@ -13,6 +13,7 @@ export default async function handler(req, res) {
     const text = body?.text ?? "";
     const facts = body?.facts ?? {};
     const tripContext = body?.tripContext ?? {};
+    const preferences = body?.preferences ?? null; // NEW: user personal preferences from the app
     const existingItems = body?.existingItems ?? [];
 
     const systemInstruction = `
@@ -41,6 +42,23 @@ You are generating content for an iOS trip planner app. The app can add four ite
   - flightFromCode / flightToCode (IATA codes like “MIA”, “JFK”) if provided or strongly implied.
 - If you do not have IATA codes, leave them empty rather than guessing incorrectly.
 - startTime/endTime can be null unless explicitly provided.
+
+Personal preferences (if provided)
+- You may receive user preferences in preferences with fields:
+  - favoriteFoodCSV (string, comma-separated)
+  - drinksAlcohol (boolean)
+  - interestsCSV (string, comma-separated)
+- Use these preferences to tailor recommendations, especially food and interest-based activities.
+- Food:
+  - Prefer restaurants/cuisines that match favoriteFoodCSV.
+  - Avoid suggesting foods that conflict with the user’s stated dislikes (if any are mentioned in the prompt).
+- Alcohol:
+  - If drinksAlcohol is false, avoid bars, breweries, wine tastings, cocktail-focused venues, and alcohol-centric experiences unless the user explicitly asks.
+  - If drinksAlcohol is true, it’s OK to include one high-quality bar/cocktail/wine experience when it fits the day.
+- Interests:
+  - Prefer activities aligned with interestsCSV (e.g., art, architecture, hiking, museums, markets, photography).
+  - If interestsCSV is empty, infer interests from the user prompt instead.
+- Do not mention these fields explicitly in the output; just use them to guide choices.
 
 Your job:
 - Interpret the user’s prompt and decide what item types make the most sense.
@@ -90,9 +108,10 @@ Planning guidance:
   - 0–3 reminders
   - 0–3 flights (only if the prompt indicates a flight)
 - Make this feel like a real day plan: morning / midday / afternoon / evening with minimal backtracking.
-- Acount for constants like breakfast in the morning, lunch midday, dinner in the afternoon, drinks at night.
+- Account for constants like breakfast in the morning, lunch midday, dinner in the evening, drinks at night (only if appropriate).
 - Put critical nuance (why this place, reservation needed, best time, proximity logic) in notes.
-- Time assignment (default times)
+
+Time assignment (default times)
 - If the user explicitly provides times, use them.
 - Otherwise, assign sensible default times for activities to make the day feel scheduled.
 - Use local time for the destination. If you cannot determine the exact date, still set times (the app can adjust) or leave null if truly uncertain.
@@ -118,6 +137,7 @@ Now produce the JSON.
       text,
       facts,
       tripContext,
+      preferences, // NEW: forwarded to Gemini
       existingItems,
     };
 
