@@ -67,6 +67,7 @@ Your job:
 - If the user asks for “best coffee”, “romantic dinner”, “kid-friendly”, “cheap eats”, “sunset view”, “locals spot”, etc., prioritize matches. Prefer renowned, highly regarded places over random options.
 - Be decisive: choose strong matches rather than many mediocre ones.
 - If uncertainty exists, note it in notes and keep dayID null.
+- If the prompt asks to provide options for a specific thing like “show me options for Michelin star restaurants”, provide those options rather than trying to plan out an entire day.
 
 Output requirements (STRICT):
 Return ONLY valid JSON with this exact shape:
