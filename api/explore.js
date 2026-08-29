@@ -5,8 +5,8 @@
  * iOS app can refresh Explore without an App Store update.
  *
  * Edit api/content/explore.json and redeploy to publish new picks.
- * Prefer coverImageURL for new entries; coverImageName only works for assets
- * already bundled in the app.
+ * Covers use coverImageURL (Unsplash for now). Do not rely on coverImageName —
+ * the app does not ship Explore images.
  */
 
 import { readFileSync, statSync } from "fs";
