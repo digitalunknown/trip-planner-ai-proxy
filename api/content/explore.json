@@ -205,6 +205,142 @@
           "accent": "blush"
         }
       ]
+    },
+    {
+      "id": "lisbon-hills",
+      "title": "Lisbon, one hill at a time",
+      "destination": "Lisbon, Portugal",
+      "publisher": "Peter Osmenda",
+      "badge": "Staff Pick",
+      "coverImageName": null,
+      "coverImageURL": "https://images.unsplash.com/photo-1585208798174-6cedd86e019a?auto=format&fit=crop&w=1600&q=80",
+      "latitude": 38.713,
+      "longitude": -9.139,
+      "mapSpan": 0.06,
+      "paragraphs": [
+        "Lisbon rewards a day that climbs and then pauses. This route stays in the historic core — Chiado, Alfama, and a miradouro — instead of trying to stitch Belém onto an already steep walk.",
+        "Start with a tart while the line is still short, then let the hills set the pace. The castle and the viewpoints are the structure; everything between them is tiled walls, tram bells, and a reason to sit down."
+      ],
+      "activities": [
+        {
+          "title": "Manteigaria",
+          "description": "Custard tarts still warm from the oven. Eat standing at the marble counter on Rua do Loreto before the late-morning queue arrives.",
+          "time": "9:30 AM",
+          "location": "Rua do Loreto 2, Lisbon",
+          "latitude": 38.7106,
+          "longitude": -9.1444,
+          "icon": "cup.and.saucer.fill",
+          "accent": "tangerine"
+        },
+        {
+          "title": "Convento do Carmo",
+          "description": "An open-air Gothic nave with no roof — sky where the vault used to be. Quiet, central, and a better first museum than anything behind a long ticket line.",
+          "time": "10:30 AM",
+          "location": "Largo do Carmo, Lisbon",
+          "latitude": 38.712,
+          "longitude": -9.1405,
+          "icon": "building.columns.fill",
+          "accent": "forest"
+        },
+        {
+          "title": "Time Out Market",
+          "description": "A graze, not a sit-down commitment. Pick one stall, eat at the communal tables, and leave before it becomes a food-hall marathon.",
+          "time": "12:30 PM",
+          "location": "Av. 24 de Julho 49, Lisbon",
+          "latitude": 38.7069,
+          "longitude": -9.1456,
+          "icon": "fork.knife",
+          "accent": "mustard"
+        },
+        {
+          "title": "Alfama lanes",
+          "description": "Wander downhill from Portas do Sol through laundry lines and azulejo corners. Get a little lost on purpose; the river keeps you oriented.",
+          "time": "3:00 PM",
+          "location": "Largo das Portas do Sol, Lisbon",
+          "latitude": 38.7118,
+          "longitude": -9.1304,
+          "icon": "figure.walk",
+          "accent": "lime"
+        },
+        {
+          "title": "Miradouro da Senhora do Monte",
+          "description": "The wide view over the castle, the river, and the 25 de Abril Bridge. Arrive before golden hour if you want a wall seat without the crush.",
+          "time": "5:30 PM",
+          "location": "Largo do Monte, Lisbon",
+          "latitude": 38.7193,
+          "longitude": -9.1328,
+          "icon": "sun.max.fill",
+          "accent": "blush"
+        }
+      ]
+    },
+    {
+      "id": "mexico-city-roma",
+      "title": "A Roma-Condesa day in Mexico City",
+      "destination": "Mexico City, Mexico",
+      "publisher": "Peter Osmenda",
+      "badge": "Staff Pick",
+      "coverImageName": null,
+      "coverImageURL": "https://images.unsplash.com/photo-1730125082387-5cbbb42bf776?auto=format&fit=crop&w=1600&q=80",
+      "latitude": 19.42,
+      "longitude": -99.17,
+      "mapSpan": 0.08,
+      "paragraphs": [
+        "Skip the historic center for a day and stay in the neighborhoods that actually set the city’s rhythm — Roma, Condesa, and the edge of Chapultepec. Tree canopy, gallery rooms, and a long lunch beat a checklist of monuments.",
+        "Move by short rides or a slow walk under the jacarandas. The castle is the one grand stop; everything else is bakeries, parks, and a table you won’t want to leave."
+      ],
+      "activities": [
+        {
+          "title": "Panadería Rosetta",
+          "description": "Guava rolls and excellent coffee in Roma Norte. Go early — the bakery empties its best loaves before the lunch crowd shows up.",
+          "time": "8:30 AM",
+          "location": "Colima 179, Roma Norte, Mexico City",
+          "latitude": 19.4197,
+          "longitude": -99.1595,
+          "icon": "cup.and.saucer.fill",
+          "accent": "tangerine"
+        },
+        {
+          "title": "Museo Tamayo",
+          "description": "Contemporary art in a low concrete building at the edge of Chapultepec. Compact enough to finish before hunger hits, with a garden break on the way out.",
+          "time": "10:30 AM",
+          "location": "Paseo de la Reforma 51, Mexico City",
+          "latitude": 19.4256,
+          "longitude": -99.1817,
+          "icon": "paintpalette.fill",
+          "accent": "forest"
+        },
+        {
+          "title": "Lunch at Contramar",
+          "description": "The tuna tostadas and grilled catch that made Roma’s long lunch famous. Book ahead; this is the day’s anchor, not a quick bite.",
+          "time": "1:00 PM",
+          "location": "Durango 200, Roma Norte, Mexico City",
+          "latitude": 19.4195,
+          "longitude": -99.1669,
+          "icon": "fork.knife",
+          "accent": "mustard"
+        },
+        {
+          "title": "Parque México",
+          "description": "Condesa’s oval park — Art Deco kiosk, dog walkers, and a full canopy. Loop once, then drift the surrounding streets for bookshops and tile facades.",
+          "time": "3:30 PM",
+          "location": "Av. México, Condesa, Mexico City",
+          "latitude": 19.4116,
+          "longitude": -99.1694,
+          "icon": "leaf.fill",
+          "accent": "lime"
+        },
+        {
+          "title": "Castillo de Chapultepec",
+          "description": "A hilltop castle with city views and rooms that actually hold a story. Late afternoon light on the terrace is the reason to save it for last.",
+          "time": "5:30 PM",
+          "location": "Bosque de Chapultepec, Mexico City",
+          "latitude": 19.4204,
+          "longitude": -99.1819,
+          "icon": "building.columns.fill",
+          "accent": "blush"
+        }
+      ]
     }
   ]
 }
