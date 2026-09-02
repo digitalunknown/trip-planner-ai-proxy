@@ -177,7 +177,9 @@ const TRIP_DRAFT_REQUIRED = [
 const CREATE_TRIP_SCHEMA = buildCreateTripSchema(0);
 
 function buildCreateTripSchema(minItems = 0) {
-  const floor = Math.max(0, Math.min(Number(minItems) || 0, 28));
+  // Keep this low: Gemini returns HTTP 400 on large minItems for this object schema
+  // (that 400 surfaces as an error toast). Long trips still return more items than the floor.
+  const floor = Math.max(0, Math.min(Number(minItems) || 0, 8));
   const itemsSchema = {
     type: "array",
     items: {
@@ -434,25 +436,25 @@ HARD FLOOR for get_started: items.length ≥ 8 unless the user explicitly declin
 When seeding restaurants/activities, still set startTime/endTime (HH:mm) so the trip opens as a usable schedule.
 
 ### full_itinerary (pack it)
-Fill the stay for the trip length (use dates or unscheduledDaysCount; default 3–5 days):
+Fill the stay for the trip length (use dates or unscheduledDaysCount; default 3–5 days — honor longer asks such as a week or 8–14 days):
 - 1 primary hotel (or 1 per city if multi-city) — dayIndex 0, dayLabel "Day 1"
-- ~1–2 meals/day as restaurant/cafe/bar activities (vary cuisine/neighborhood)
-- ~2–3 activities/attractions per day with dayIndex/dayLabel
+- ~1–2 meals/day as restaurant/cafe/bar activities on shorter trips (vary cuisine/neighborhood)
+- ~2–3 activities/attractions per day on shorter trips; for long stays, one real highlight on most days is enough
 - 1 flight item if flights are implied; else skip
 - 1 solid packing checklist (8–12 lines in checklistItemsText) — dayIndex 0
 - 2–4 reminders (visa/passport, reservations, transit passes, etc.) — dayIndex 0
-Target roughly 12–28 items for a 3–5 day trip — never stop at 1–3 filler highlights.
-HARD FLOOR: items.length must be ≥ 8 for any 2+ day trip (typically ≥ 4×dayCount venue activities + hotel + checklist + reminders). A single hotel is NEVER a valid full_itinerary.
+Never stop at 1–3 filler highlights. Do not pack 4 meals × every day on long trips — the items array must still fit in one response.
+HARD FLOOR: items.length must be ≥ 8 for any 2+ day trip (hotel + checklist + reminders + real venue highlights). A single hotel is NEVER a valid full_itinerary.
 CRITICAL timing: every venue activity (meals + attractions) MUST set both startTime and endTime as HH:mm, sequenced morning→night on that day with no overlaps. Hotel / checklist / reminder items may leave times null.
 Keep notes to one short sentence so the full items array fits in one response.
 
 ## Day spreading (HARD — full_itinerary and any multi-day ask)
-- unscheduledDaysCount (or date span) is the trip length D. Use every day.
+- unscheduledDaysCount (or date span) is the trip length D. Honor D even when D is 6, 8, 10, or more — never shrink the trip to 5 days.
 - Every day-scoped activity/meal MUST set dayIndex (0…D-1) AND dayLabel ("Day 1"…"Day D").
-- Spread venue activities across ALL days: each dayIndex from 0 to D-1 must appear on multiple items.
+- Spread venue activities across the stay. For long trips, one highlight on most days beats stuffing Day 1.
 - NEVER dump the whole itinerary on dayIndex 0 / "Day 1" when D ≥ 2.
 - Hotel / packing checklist / prep reminders may stay on dayIndex 0; sightseeing and meals must not.
-- Example for a 5-day trip: include activities labeled Day 1, Day 2, Day 3, Day 4, and Day 5.
+- Example: a 5-day trip should include Day 1…Day 5 labels; an 8-day trip should still be 8 days on the trip object.
 
 ## alternatives
 Always return []. Never invent alternate destinations or competing trip drafts.
@@ -945,12 +947,12 @@ function createTripDayCount(trip, text) {
 
 /**
  * Structural / retry floor that can finish in one Gemini response.
- * Long trips used to demand 22 fully-specified items (plus 7×5 slot refills),
- * which routinely hit MAX_TOKENS and salvaged a single hotel.
+ * Do not scale this with day count: Gemini returns HTTP 400 (client error toast)
+ * when create_trip schema minItems grows with 6+ day prompts.
  */
 function completableCreateTripItemCount(days) {
-  const n = Math.max(1, Math.min(Number(days) || 3, 30));
-  return Math.max(8, Math.min(n + 4, 12));
+  void days;
+  return 8;
 }
 
 /** Minimum seed items for a usable create_trip draft. */
@@ -961,7 +963,7 @@ function minCreateTripItemCount(trip, text) {
 /** Explicit day-by-day slots so under-delivery retries can't collapse to a hotel. */
 function buildCreateTripSlotList(days, destination) {
   const dest = safeString(destination).trim() || "the destination city";
-  const n = Math.max(1, Math.min(Number(days) || 3, 10));
+  const n = Math.max(1, Math.min(Number(days) || 3, 30));
   const kinds = ["cafe", "attraction", "restaurant", "hike", "beach"];
   const lines = [];
   let i = 1;
@@ -1546,6 +1548,18 @@ export default async function handler(req, res) {
     }
 
     let firstCall = await callGemini(userMessage);
+    // Gemini rejects oversized structured schemas with HTTP 400 in under a second
+    // (surfaces as an error toast on 6+ day create_trip prompts). Retry without minItems.
+    if (
+      !firstCall.ok &&
+      (firstCall.status === 400 || firstCall.status === 422) &&
+      mode === "create_trip"
+    ) {
+      const relaxed = await callGemini(userMessage, {
+        responseSchema: buildCreateTripSchema(0),
+      });
+      if (relaxed.ok) firstCall = relaxed;
+    }
     // Parse failure: retry once with a smaller, shorter payload (truncation / empty candidates).
     if (!firstCall.ok && firstCall.error === "Gemini returned no usable JSON") {
       const compactCreateMin =
