@@ -19,6 +19,7 @@ PROJECT_CONTEXT.md
 TYPOGRAPHY.md
 
 # Local / secrets / tooling
+test/
 .git/
 .cursor/
 .vercel/

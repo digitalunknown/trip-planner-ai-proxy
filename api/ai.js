@@ -66,6 +66,10 @@ function baseItemProperties() {
     confidence: { type: "number" },
     sourceSnippet: { type: "string" },
     category: { type: "string" },
+    // Approximate coordinates let the server enforce a travel radius before the
+    // client spends MapKit lookups on places that are nowhere near the user.
+    latitude: { type: "number", nullable: true },
+    longitude: { type: "number", nullable: true },
   };
 }
 
@@ -86,6 +90,9 @@ const BASE_REQUIRED = [
   "sourceSnippet",
   "category",
 ];
+
+/** Coordinates are required wherever we filter by distance from an origin. */
+const GEO_REQUIRED = ["latitude", "longitude"];
 
 /** Static schema kept for reference; prefer buildPlanDaySchema(minItems). */
 const PLAN_DAY_SCHEMA = buildPlanDaySchema(0);
@@ -133,7 +140,12 @@ function buildPlaceFinderSchema(minItems = 0) {
         ...baseItemProperties(),
         category: { type: "string", enum: PLACE_FINDER_CATEGORIES },
       },
-      required: ["kind", "category", ...BASE_REQUIRED.filter((k) => k !== "category")],
+      required: [
+        "kind",
+        "category",
+        ...BASE_REQUIRED.filter((k) => k !== "category"),
+        ...GEO_REQUIRED,
+      ],
     },
   };
   if (floor > 0) {
@@ -172,6 +184,78 @@ const TRIP_DRAFT_REQUIRED = [
   "summary",
   "confidence",
 ];
+
+const RECOMMENDATION_INTENTS = [
+  "destination_discovery",
+  "stay_recommendations",
+  "restaurant_recommendations",
+  "activity_recommendations",
+  "place_discovery",
+  "clarification_needed",
+];
+
+/**
+ * Recommendation lists: N standalone picks of ONE kind, no schedule.
+ *
+ * `includeTripShell` keeps create_trip callers working — that client path
+ * treats a missing trip as a hard failure, so we hand back a region-level
+ * shell alongside the picks and let `routing` tell newer clients the truth.
+ */
+function buildRecommendationSchema(plan, minItems = 0, { includeTripShell = false } = {}) {
+  const floor = Math.max(0, Math.min(Number(minItems) || 0, 12));
+  const categories =
+    DELIVERABLE_CATEGORIES[plan?.deliverable] ?? PLACE_FINDER_CATEGORIES;
+
+  const itemsSchema = {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["place"] },
+        ...baseItemProperties(),
+        category: { type: "string", enum: categories },
+        // Distance from the user's origin, so the answer is auditable.
+        travelMilesFromOrigin: { type: "number", nullable: true },
+        travelTimeFromOrigin: { type: "string", nullable: true },
+      },
+      required: [
+        "kind",
+        "category",
+        ...BASE_REQUIRED.filter((k) => k !== "category"),
+        ...GEO_REQUIRED,
+      ],
+    },
+  };
+  if (floor > 0) {
+    itemsSchema.minItems = floor;
+  }
+
+  const properties = {
+    intent: { type: "string", enum: RECOMMENDATION_INTENTS },
+    clarificationNeeded: { type: "boolean" },
+    clarificationPrompt: { type: "string" },
+    items: itemsSchema,
+  };
+  if (includeTripShell) {
+    properties.trip = {
+      type: "object",
+      properties: TRIP_DRAFT_PROPERTIES,
+      required: TRIP_DRAFT_REQUIRED,
+    };
+  }
+
+  return {
+    type: "object",
+    properties,
+    required: [
+      "intent",
+      "clarificationNeeded",
+      "clarificationPrompt",
+      "items",
+      ...(includeTripShell ? ["trip"] : []),
+    ],
+  };
+}
 
 /** Static schema kept for reference; prefer buildCreateTripSchema(minItems). */
 const CREATE_TRIP_SCHEMA = buildCreateTripSchema(0);
@@ -230,14 +314,35 @@ function buildCreateTripSchema(minItems = 0) {
 const SHARED_BRAIN = `
 You are TripStacks AI — the planning brain for an iOS trip app.
 
-You help with exactly three jobs, one per call mode:
+You help with these jobs, one per call mode:
 1) plan_day — organize itineraries / options inside an existing trip
 2) place_finder — discover places worth saving to the user's Places library
 3) create_trip — draft a new trip the user can create and refine
+4) recommendations — answer a discovery ask with a list of picks, no schedule
+
+## Read the ask along two axes before anything else
+AXIS 1 — WHERE is this about?
+- A named destination ("5 days in Los Angeles") → plan/recommend inside that place.
+- A search around a point ("within a 5 hour drive of me", "in the Pacific Northwest")
+  → the answer is a SET of places found by searching outward from an anchor.
+  The anchor is the user's origin when they say "me/here/nearby", never a guess.
+
+AXIS 2 — WHAT shape of answer is wanted?
+- A full itinerary: they asked you to plan/schedule a trip.
+- A recommendation list: they asked for one kind of thing — destinations, stays,
+  restaurants, or activities. Then a full itinerary is the WRONG answer. Return
+  only that one kind, unscheduled, and nothing else.
+
+These are independent. "Find hotels for my 5 day LA trip" names a destination but
+wants only stays. "Where should we go for the long weekend?" wants destinations,
+not a packed schedule. A duration or holiday in the ask ("Labor Day weekend")
+tells you WHEN, and never by itself means "build me an itinerary."
 
 General rules (all modes):
 - Be specific, real-world, and "best of the best." No generic filler.
 - Never invent venues, airports, or addresses you are not confident about.
+- Never answer a distance-bounded ask with a famous destination outside the range.
+  Correct-but-modest beats famous-but-wrong, every time.
 - Prefer asking one clarifying question over a wild guess when destination/dates are missing and cannot be inferred.
 - Obey the JSON schema for this mode exactly. No markdown, no code fences, no extra keys.
 - Personalization fields (preferences, existingPlaces, existingTrips, existingItems) are signals — never mention them by name in titles/notes.
@@ -260,6 +365,7 @@ PlanItem fields (ALWAYS include every field; use "" or null if not applicable):
 - flightFromCode / flightToCode / flightNumber: flight only; else ""
 - confidence: 0.0–1.0
 - sourceSnippet: key phrase from the user prompt that caused the item
+- latitude / longitude: approximate decimal degrees for the place itself (null only if genuinely unknown). Required for place items — these are used to verify the place is where you claim it is.
 
 Rules:
 - Set dayID to null for ALL items.
@@ -296,8 +402,15 @@ Rules:
 6. For day_plan / multi_day_plan / create_trip full itinerary: every venue activity has startTime AND endTime (HH:mm), ordered chronologically?
 `;
 
-function buildPlanDayPrompt() {
-  return `${SHARED_BRAIN}
+function buildPlanDayPrompt(plan) {
+  const geoBlock = plan?.origin || plan?.radius ? `\n${buildGeoAnchorInstructions(plan)}\n` : "";
+  // A single-kind ask here is options_list, which stays kind=activity so the
+  // results can drop onto a day board.
+  const kindBlock =
+    plan?.isRecommendation && plan.deliverable !== DELIVERABLES.MIXED_PLACES
+      ? `\n## Requested kind (HARD)\nThe user asked for ${describeDeliverable(plan.deliverable)}. Intent MUST be options_list — NOT day_plan. Return only that kind, with kind="activity" and a matching category. No schedule, no meal pacing, no filler of other kinds.\n`
+      : "";
+  return `${SHARED_BRAIN}${geoBlock}${kindBlock}
 
 You are generating itinerary content inside an existing trip.
 
@@ -352,8 +465,13 @@ ${SHARED_OUTPUT_CONTRACT}
 `;
 }
 
-function buildPlaceFinderPrompt() {
-  return `${SHARED_BRAIN}
+function buildPlaceFinderPrompt(plan) {
+  const geoBlock = plan ? `\n${buildGeoAnchorInstructions(plan)}\n` : "";
+  const kindBlock =
+    plan?.deliverable && plan.deliverable !== DELIVERABLES.MIXED_PLACES
+      ? `\n## Requested kind (HARD)\nThe user asked for ${describeDeliverable(plan.deliverable)}. EVERY item must be that kind — do not mix in other categories.\nAllowed categories: ${(DELIVERABLE_CATEGORIES[plan.deliverable] ?? PLACE_FINDER_CATEGORIES).join(", ")}.\n`
+      : "";
+  return `${SHARED_BRAIN}${geoBlock}${kindBlock}
 
 You are a local discovery guide for the Places library. You are NOT planning a day or schedule. No morning/afternoon pacing. startTime/endTime must be null. Every item kind="place".
 
@@ -387,6 +505,163 @@ Match what was asked ("hotels" / "stays" → every category=hotel; "restaurants"
 
 ## Good suggestions
 Renowned real venues with maps-searchable location (venue + city). Notes explain why worth saving. No proximity clustering for a schedule.
+
+${SHARED_OUTPUT_CONTRACT}
+`;
+}
+
+/** The one kind of pick the user asked for, phrased for the model. */
+function describeDeliverable(deliverable) {
+  switch (deliverable) {
+    case DELIVERABLES.DESTINATIONS:
+      return "distinct DESTINATIONS worth traveling to — towns, cities, state/national parks, coastal or mountain areas. NOT individual venues inside one city";
+    case DELIVERABLES.STAYS:
+      return "places to STAY — real, bookable hotels, resorts, inns, or lodges";
+    case DELIVERABLES.RESTAURANTS:
+      return "places to EAT or DRINK — named restaurants, cafes, or bars";
+    case DELIVERABLES.ACTIVITIES:
+      return "ACTIVITIES and ATTRACTIONS — things to do, see, hike, or experience";
+    default:
+      return "notable PLACES worth saving";
+  }
+}
+
+/**
+ * Where to anchor the answer geographically.
+ *
+ * The origin block is the fix for "cool spots within 5 hours of me" answers
+ * that drifted to famous regions thousands of miles from the actual user.
+ */
+function buildGeoAnchorInstructions(plan) {
+  const origin = plan?.origin;
+  const radius = plan?.radius;
+
+  if (plan?.geoScope === "origin_radius" && origin) {
+    const label = origin.label || "the user's current location";
+    const coords = `${origin.latitude.toFixed(4)}, ${origin.longitude.toFixed(4)}`;
+    const budget = radius
+      ? radius.driveHours
+        ? `HARD LIMIT: every pick must be reachable in about ${radius.driveHours} hour(s) of driving from the origin — roughly ${radius.miles} road miles. Nothing farther.`
+        : `HARD LIMIT: every pick must be within about ${radius.miles} miles of the origin. Nothing farther.`
+      : "Keep every pick within a comfortable day-trip or weekend range of the origin.";
+
+    return `## Origin anchor (HARDEST CONSTRAINT — read twice)
+ORIGIN = ${label}, at coordinates ${coords}. This is where the user physically is right now.
+${budget}
+
+Before naming any place, reason about it:
+1. Where is this place, and what are its approximate coordinates?
+2. How far is it from ${coords} — and is that inside the limit above?
+3. If it is outside the limit, DISCARD it and pick something closer.
+
+CRITICAL FAILURE MODE TO AVOID: do NOT fall back on famous road-trip regions
+(Lake Tahoe, Big Sur, Napa, the Grand Canyon, the Catskills, Joshua Tree, …)
+out of habit. They only qualify if they genuinely sit inside the radius of
+THIS origin. A well-known destination on the wrong side of the country is the
+worst possible answer — a modest town actually within range is far better.
+
+Spread picks across MULTIPLE directions from the origin (north / south / east /
+west / inland / coastal), and vary the distance so some are close and some are
+near the edge of the range.
+Set travelMilesFromOrigin to your driving-mile estimate from the origin, and
+travelTimeFromOrigin to a short string like "3h 15m".
+Every item MUST include latitude and longitude for the place itself.`;
+  }
+
+  if (plan?.geoScope === "origin_radius") {
+    return `## Origin anchor
+The user is measuring distance from themselves, but no coordinates were provided.
+Set clarificationNeeded=true and ask which city or area they're starting from. Do NOT guess a region.`;
+  }
+
+  const anchorLines = [
+    "## Geographic anchor (priority order)",
+    "1. A place named in the user's prompt — this ALWAYS wins.",
+    "2. tripContext.destination.",
+    "3. A strong regional signal from existingPlaces.",
+  ];
+  if (radius) {
+    anchorLines.push(
+      radius.driveHours
+        ? `Travel budget: stay within about ${radius.driveHours} hour(s) driving (~${radius.miles} miles) of that anchor.`
+        : `Travel budget: stay within about ${radius.miles} miles of that anchor.`
+    );
+  }
+  anchorLines.push(
+    "Every item.location MUST name the anchor city/area so Maps resolves it uniquely.",
+    "Never reuse a same-named street or venue from a different city.",
+    "Every item MUST include latitude and longitude for the place itself."
+  );
+  return anchorLines.join("\n");
+}
+
+/**
+ * Recommendation lists — N picks of one kind, with no schedule bolted on.
+ * Used whenever the ask is discovery ("find me…") rather than "plan my trip".
+ */
+function buildRecommendationPrompt(plan) {
+  const count = plan?.requestedCount ?? 10;
+  const target = describeDeliverable(plan?.deliverable);
+  const categories =
+    DELIVERABLE_CATEGORIES[plan?.deliverable] ?? PLACE_FINDER_CATEGORIES;
+
+  const destinationRules =
+    plan?.deliverable === DELIVERABLES.DESTINATIONS
+      ? `
+## Destination discovery specifics
+Each item is a PLACE YOU TRAVEL TO, not a restaurant or a single building.
+Good: "Mendocino, CA", "Shenandoah National Park, VA", "Galena, IL".
+Bad: a cafe, a hotel, a museum, or ten venues all inside one city.
+Every item must be a DIFFERENT destination — never two entries in the same town.
+Use title = the destination name, subtitle = a 3–6 word hook ("coastal cliffs and wineries"),
+notes = one short sentence on why it's worth the drive and what it's known for.
+Set category to "other" for towns/regions, or park/beach/viewpoint/attraction when the destination IS that feature.
+`
+      : "";
+
+  const seasonRules = `
+## Dates and season
+If the ask names a date, holiday, or season (e.g. "Labor Day weekend", "in February"),
+use it ONLY to bias what's actually good then — open season, weather, crowds, festivals.
+Mention the seasonal reason in notes when it matters.
+NEVER convert a dated ask into a scheduled itinerary. Dates change WHICH places you
+recommend, never the SHAPE of the answer.
+`;
+
+  return `${SHARED_BRAIN}
+
+You are answering a DISCOVERY ask. The user wants a list of recommendations —
+they did NOT ask you to plan or schedule a trip.
+
+## What to return
+Return ${count} ${target}.
+
+ABSOLUTE RULES (violating these makes the answer useless):
+- Every item uses kind="place".
+- startTime and endTime MUST be null. dayIndex MUST be null. dayLabel MUST be "".
+- NO checklists. NO reminders. NO flights. NO packing lists. NO hotels unless stays were asked for.
+- Do NOT build a day-by-day plan, do NOT cluster items into a schedule, do NOT
+  add filler items of other kinds to hit a count.
+- Every item independently answers the user's question. A user should be able to
+  pick any one of them and ignore the rest.
+
+## Category discipline
+Allowed categories: ${categories.join(", ")}.
+Return ONLY the kind of thing that was asked for. If the user asked for places to
+stay, every item is a stay. If they asked where to go, every item is a destination.
+Do not mix in other kinds "for completeness".
+
+${buildGeoAnchorInstructions(plan)}
+${destinationRules}${seasonRules}
+## Count (HARD)
+Return exactly ${count} items unless clarificationNeeded=true (then items=[]).
+Each must be real, specific, and named — never a category, a vague area, or a tip.
+Vary vibe, price, and area. No duplicates, and dedup against existingPlaces.
+If you can only think of a few, keep working until you have ${count} real ones.
+
+## Quality
+Well-regarded, real places a local would actually endorse. Notes explain why this
+pick earns its spot, in one short sentence. No marketing filler.
 
 ${SHARED_OUTPUT_CONTRACT}
 `;
@@ -504,6 +779,489 @@ function explicitPlaceCountValue(text) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Geography: where the user is measuring from, and how far they'll travel
+// ---------------------------------------------------------------------------
+
+/** Sustained highway average used to turn "5 hour drive" into a mile radius. */
+const AVERAGE_DRIVE_MPH = 55;
+const MILES_PER_KM = 0.621371;
+
+function finiteNumber(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/** A usable coordinate pair, or null. Rejects the 0,0 "unset" sentinel. */
+function normalizeCoordinate(latitude, longitude) {
+  const lat = finiteNumber(latitude);
+  const lon = finiteNumber(longitude);
+  if (lat == null || lon == null) return null;
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+  if (Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001) return null;
+  return { latitude: lat, longitude: lon };
+}
+
+/**
+ * The point the user is measuring distance from.
+ * Explicit userLocation wins; an active trip's coordinates are the fallback.
+ */
+function resolveOrigin(body, tripContext) {
+  const raw = body?.userLocation ?? body?.currentLocation ?? null;
+  const fromBody = normalizeCoordinate(raw?.latitude, raw?.longitude);
+  if (fromBody) {
+    return {
+      ...fromBody,
+      label: safeString(raw?.label).trim(),
+      source: "user_location",
+    };
+  }
+  const fromTrip = normalizeCoordinate(tripContext?.latitude, tripContext?.longitude);
+  if (fromTrip) {
+    return {
+      ...fromTrip,
+      label: safeString(tripContext?.destination).trim(),
+      source: "trip_context",
+    };
+  }
+  return null;
+}
+
+/** Great-circle miles between two coordinate pairs. */
+function haversineMiles(a, b) {
+  if (!a || !b) return null;
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const earthRadiusMiles = 3958.8;
+  const dLat = toRad(b.latitude - a.latitude);
+  const dLon = toRad(b.longitude - a.longitude);
+  const lat1 = toRad(a.latitude);
+  const lat2 = toRad(b.latitude);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 2 * earthRadiusMiles * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+/**
+ * "within a 5 hour drive" / "under 200 miles" / "2hr drive" → travel budget.
+ * Straight-line miles run ~20% short of road miles, so the check radius is padded.
+ */
+function parseTravelRadius(text) {
+  const raw = safeString(text);
+  if (!raw) return null;
+
+  const hourPatterns = [
+    /\bwithin\s+(?:about\s+|roughly\s+|around\s+|~\s*)?(?:a\s+|an\s+)?(\d{1,2})\s*-?\s*(?:hours?|hrs?|h)\b/i,
+    /\b(\d{1,2})\s*-?\s*(?:hours?|hrs?)\s+(?:drive|driving|road\s*trip|ride|away|radius|from|of)\b/i,
+    /\b(?:drive|driving|road\s*trip)\s+(?:of\s+)?(?:up\s+to\s+)?(\d{1,2})\s*-?\s*(?:hours?|hrs?)\b/i,
+  ];
+  for (const re of hourPatterns) {
+    const m = raw.match(re);
+    if (!m) continue;
+    const hours = parseInt(m[1], 10);
+    if (hours >= 1 && hours <= 24) {
+      return {
+        driveHours: hours,
+        miles: Math.round(hours * AVERAGE_DRIVE_MPH),
+        source: "drive_hours",
+      };
+    }
+  }
+
+  const miles = raw.match(
+    /\b(?:within|under|less\s+than|up\s+to|inside)\s+(?:about\s+|roughly\s+|~\s*)?(\d{2,4})\s*(?:miles?|mi)\b/i
+  );
+  if (miles) {
+    const n = parseInt(miles[1], 10);
+    if (n >= 5 && n <= 3000) {
+      return { driveHours: null, miles: n, source: "miles" };
+    }
+  }
+
+  const km = raw.match(
+    /\b(?:within|under|less\s+than|up\s+to|inside)\s+(?:about\s+|roughly\s+|~\s*)?(\d{2,4})\s*(?:km|kilometers?|kilometres?)\b/i
+  );
+  if (km) {
+    const n = parseInt(km[1], 10);
+    if (n >= 5 && n <= 5000) {
+      return {
+        driveHours: null,
+        miles: Math.round(n * MILES_PER_KM),
+        source: "km",
+      };
+    }
+  }
+  return null;
+}
+
+/** Straight-line tolerance for a road-distance budget (roads wander). */
+function radiusCheckMiles(radius) {
+  const miles = finiteNumber(radius?.miles);
+  if (miles == null) return null;
+  return Math.max(25, Math.round(miles * 0.85));
+}
+
+/**
+ * True when the ask names something to measure distance from, as in "within 2
+ * hours of Denver". Those must stay anchored on that place — substituting the
+ * device location would search around the wrong city entirely.
+ */
+function hasNamedRadiusAnchor(text) {
+  const raw = safeString(text);
+  if (!raw) return false;
+  return /\b(?:of|from|around|outside)\s+(?!me\b|here\b|my\b|home\b|us\b|our\b)[A-Za-z][\w.'-]*/i.test(
+    raw
+  );
+}
+
+/** True when the ask measures from the *user*, not from a named city. */
+function mentionsOrigin(text) {
+  const raw = safeString(text);
+  if (!raw) return false;
+  return [
+    /\bnear\s+(?:me|my\b)/i,
+    /\bfrom\s+(?:me|here)\b/i,
+    /\b(?:of|to|from)\s+me\b/i,
+    /\baround\s+(?:me|here)\b/i,
+    /\bclose\s+(?:to|by)\s+(?:me|here|home)\b/i,
+    /\bmy\s+(?:area|region|city|town|neighborhood|location|place|home)\b/i,
+    /\bnearby\b/i,
+    /\bwhere\s+i\s+(?:am|live)\b/i,
+    /\bcurrent\s+location\b/i,
+    /\bdriving\s+distance\b/i,
+    /\bi'?m\s+(?:currently\s+)?(?:in|near|at)\b/i,
+  ].some((re) => re.test(raw));
+}
+
+/**
+ * Drop picks that fall outside the requested travel radius.
+ *
+ * The backstop for a model naming a famous-but-far place: given the origin and
+ * the item's own coordinates, we can just measure it and reject the outliers
+ * instead of trusting the prose. Items without coordinates are kept, since the
+ * client still resolves those through MapKit.
+ */
+function enforceTravelRadius(items, plan) {
+  const origin = plan?.origin;
+  const limit = plan?.radiusCheckMiles;
+  const list = Array.isArray(items) ? items : [];
+  if (!origin || limit == null) return { items: list, dropped: [] };
+
+  const kept = [];
+  const dropped = [];
+  for (const item of list) {
+    const coordinate = normalizeCoordinate(item?.latitude, item?.longitude);
+    if (!coordinate) {
+      kept.push(item);
+      continue;
+    }
+    const miles = haversineMiles(origin, coordinate);
+    if (miles == null) {
+      kept.push(item);
+      continue;
+    }
+    if (miles > limit) {
+      dropped.push({ title: safeString(item?.title), miles: Math.round(miles) });
+      continue;
+    }
+    kept.push({ ...item, straightLineMilesFromOrigin: Math.round(miles) });
+  }
+  return { items: kept, dropped };
+}
+
+// ---------------------------------------------------------------------------
+// Ask classification: what shape of answer does this prompt actually want?
+// ---------------------------------------------------------------------------
+
+/** What the user wants back — an itinerary, or one specific kind of pick. */
+const DELIVERABLES = {
+  FULL_ITINERARY: "full_itinerary",
+  DESTINATIONS: "destinations",
+  STAYS: "stays",
+  RESTAURANTS: "restaurants",
+  ACTIVITIES: "activities",
+  MIXED_PLACES: "mixed_places",
+};
+
+/** Deliverables that are recommendation lists, never a scheduled trip. */
+const RECOMMENDATION_DELIVERABLES = new Set([
+  DELIVERABLES.DESTINATIONS,
+  DELIVERABLES.STAYS,
+  DELIVERABLES.RESTAURANTS,
+  DELIVERABLES.ACTIVITIES,
+  DELIVERABLES.MIXED_PLACES,
+]);
+
+/** Place categories to return for each recommendation deliverable. */
+const DELIVERABLE_CATEGORIES = {
+  [DELIVERABLES.DESTINATIONS]: ["other", "attraction", "park", "beach", "viewpoint"],
+  [DELIVERABLES.STAYS]: ["hotel"],
+  [DELIVERABLES.RESTAURANTS]: ["restaurant", "cafe", "bar"],
+  [DELIVERABLES.ACTIVITIES]: [
+    "attraction",
+    "museum",
+    "park",
+    "beach",
+    "hike",
+    "viewpoint",
+    "nightlife",
+    "shopping",
+    "kids",
+  ],
+};
+
+/** Explicit "plan the whole trip" language — outranks topic keywords. */
+function wantsFullItinerary(text) {
+  const raw = safeString(text);
+  if (!raw) return false;
+  return [
+    /\bitinerar(?:y|ies)\b/i,
+    /\bday[-\s]by[-\s]day\b/i,
+    /\bfull\s+(?:trip|plan|itinerary|schedule)\b/i,
+    /\bplan\s+(?:out\s+)?(?:everything|the\s+whole|my\s+whole)\b/i,
+    /\bpack\s+(?:the|my)\s+itinerary\b/i,
+    /\bplan\s+(?:me\s+)?(?:a|an|my|our)\s+(?:\w+\s+){0,3}?(?:trip|vacation|holiday|getaway|honeymoon|weekend)\b/i,
+    /\b(?:plan|schedule)\s+(?:a|an|my|our)?\s*\d{1,2}\s*-?\s*days?\b/i,
+    /\bcreate\s+(?:a|an|my)\s+(?:\w+\s+){0,3}?trip\b/i,
+    /\btrip\s+to\s+\w+/i,
+  ].some((re) => re.test(raw));
+}
+
+/**
+ * "find / show / suggest / where can I…" — the user is asking to be shown
+ * options. Combined with a named kind this outranks any mention of a trip,
+ * so "find hotels for my 5 day trip to LA" returns hotels, not an itinerary.
+ */
+function hasDiscoveryVerb(text) {
+  const raw = safeString(text);
+  if (!raw) return false;
+  return [
+    /\b(?:find|show|suggest|recommend)\b/i,
+    // Not bare "list" — refill prompts say "packing list", which is not an ask.
+    /\blist\s+(?:me\b|some\b|\d+|the\s+(?:best|top)\b)/i,
+    /\bgive\s+me\b/i,
+    /\bwhat\s+(?:are|is)\b/i,
+    /\bwhere\s+(?:can|should|to|are)\b/i,
+    /\bwhich\b/i,
+    /\bany\s+(?:good|great|nice|cool)\b/i,
+    /\blooking\s+for\b/i,
+    /\b(?:ideas?|options?|recommendations?|suggestions?)\s+(?:for|near|around|in)\b/i,
+    /\bbest\b/i,
+    /\btop\s+\d+\b/i,
+    /\bcool\b/i,
+  ].some((re) => re.test(raw));
+}
+
+/** The single kind of thing the user asked for, or null when unstated. */
+function detectDeliverable(text) {
+  const raw = safeString(text);
+  if (!raw) return null;
+
+  const tests = [
+    [
+      DELIVERABLES.STAYS,
+      /\b(?:hotels?|stays?|accommodations?|accomodations?|lodging|lodges?|airbnbs?|resorts?|motels?|hostels?|places?\s+to\s+stay|where\s+to\s+stay)\b/i,
+    ],
+    [
+      DELIVERABLES.RESTAURANTS,
+      /\b(?:restaurants?|food|eats?|dining|dinner|lunch|brunch|breakfast|cafes?|coffee\s+shops?|bars?|breweries|places?\s+to\s+eat|where\s+to\s+eat)\b/i,
+    ],
+    [
+      DELIVERABLES.DESTINATIONS,
+      /\b(?:destinations?|towns?|cities|villages?|locations?|getaways?|places?\s+to\s+(?:go|visit|travel)|where\s+(?:should|can|to)\s+(?:i|we)\s+(?:go|travel|visit)|where\s+to\s+go|road\s*trip\s+ideas?)\b/i,
+    ],
+    [
+      DELIVERABLES.ACTIVITIES,
+      /\b(?:activities|things?\s+to\s+do|attractions?|sights?|sightseeing|museums?|hikes?|hiking|trails?|beaches?|parks?|experiences?|excursions?)\b/i,
+    ],
+  ];
+
+  for (const [deliverable, re] of tests) {
+    if (re.test(raw)) return deliverable;
+  }
+  return null;
+}
+
+/**
+ * Resolve what to answer and where to anchor it.
+ *
+ * Two independent questions, which used to be conflated into "it's a trip":
+ * 1. geoScope — is a destination named, or is this a search around a point?
+ * 2. deliverable — a full itinerary, or just one kind of recommendation?
+ */
+function resolveAskPlan({ mode, text, tripContext, origin }) {
+  const raw = safeString(text);
+  const radius = parseTravelRadius(raw);
+  // Internal refill prompts state their intent outright ("Intent=full_itinerary").
+  // That declaration is authoritative — a refill must never become a pick list.
+  const declaredIntent = raw.match(/\bintent\s*=\s*([a-z_]+)/i)?.[1]?.toLowerCase() ?? null;
+  const explicitItinerary =
+    declaredIntent === "full_itinerary" || wantsFullItinerary(raw);
+  const detected = detectDeliverable(raw);
+  const originAsk = mentionsOrigin(raw);
+
+  // A radius is measured from the user only when they refer to themselves, or
+  // when the distance phrase has no anchor of its own to measure from.
+  const anchoredOnOrigin =
+    originAsk ||
+    (radius != null && !explicitItinerary && !hasNamedRadiusAnchor(raw));
+
+  let geoScope;
+  if (anchoredOnOrigin) {
+    geoScope = "origin_radius";
+  } else if (safeString(tripContext?.destination).trim()) {
+    geoScope = "trip_destination";
+  } else {
+    geoScope = "named_destination";
+  }
+
+  // Asking to be *shown* a named kind of thing beats a passing mention of a
+  // trip, and a radius search is always discovery. Otherwise an explicit
+  // "plan my trip" wins, and a duration alone never implies an itinerary.
+  const topicWins =
+    Boolean(detected) &&
+    declaredIntent !== "full_itinerary" &&
+    (hasDiscoveryVerb(raw) || geoScope === "origin_radius");
+
+  let deliverable;
+  if (explicitItinerary && !topicWins) {
+    deliverable = DELIVERABLES.FULL_ITINERARY;
+  } else if (detected) {
+    deliverable = detected;
+  } else if (mode === "place_finder") {
+    deliverable = DELIVERABLES.MIXED_PLACES;
+  } else if (mode === "create_trip") {
+    deliverable = DELIVERABLES.FULL_ITINERARY;
+  } else {
+    deliverable = null;
+  }
+
+  // Searching around a point with no named destination is discovery, not a trip.
+  if (
+    geoScope === "origin_radius" &&
+    deliverable === DELIVERABLES.FULL_ITINERARY &&
+    !explicitItinerary
+  ) {
+    deliverable = DELIVERABLES.DESTINATIONS;
+  }
+
+  const isRecommendation = RECOMMENDATION_DELIVERABLES.has(deliverable);
+
+  return {
+    geoScope,
+    deliverable,
+    isRecommendation,
+    radius,
+    // Only measure against the origin when the radius is actually relative to
+    // it; "within 30 miles of Chicago" must not be checked against the device.
+    radiusCheckMiles: geoScope === "origin_radius" ? radiusCheckMiles(radius) : null,
+    origin: origin ?? null,
+    // "Near me" with no coordinates must ask, not guess a random region.
+    needsOrigin: geoScope === "origin_radius" && !origin,
+    requestedCount: explicitPlaceCountValue(raw),
+  };
+}
+
+/**
+ * Clients append count/itinerary boilerplate to `text` before sending it.
+ * That prose would skew the classifier — an appended "1 hotel, a few
+ * restaurants" reads as a stays ask — so classify on the user's own words.
+ * Newer clients send `rawText`; this is the fallback for the rest.
+ */
+function stripClientBoilerplate(text) {
+  const raw = safeString(text);
+  if (!raw) return raw;
+  const marker = raw.search(
+    /\n\s*\n\s*Return\s+(?:a\s+full_itinerary\b|exactly\s+\d+|\d+\s*[–—-]\s*\d+\s+distinct|\d+\s+distinct)/i
+  );
+  return marker > 0 ? raw.slice(0, marker).trim() : raw;
+}
+
+/** What to ask when the user measured from themselves but sent no coordinates. */
+function originClarificationPrompt(plan) {
+  const radius = plan?.radius;
+  const budget = radius?.driveHours
+    ? ` I'll look for spots within about a ${radius.driveHours}-hour drive.`
+    : radius?.miles
+      ? ` I'll stay within about ${radius.miles} miles.`
+      : "";
+  if (plan?.deliverable === DELIVERABLES.DESTINATIONS) {
+    return `Which city are you starting from?${budget}`;
+  }
+  return `What city or area should I search around?${budget}`;
+}
+
+/** Append count + shape discipline to a discovery ask (never itinerary prose). */
+function enforceRecommendationAsk(text, plan, count) {
+  const raw = safeString(text).trim();
+  if (!raw) return raw;
+  const target = describeDeliverable(plan?.deliverable);
+  const lines = [
+    raw,
+    "",
+    `Return exactly ${count} ${target}.`,
+    "This is a recommendation list, NOT an itinerary: no schedule, no times, no packing list, no reminders.",
+  ];
+  if (plan?.geoScope === "origin_radius" && plan?.origin) {
+    const label = plan.origin.label || "the origin coordinates";
+    lines.push(
+      plan.radius?.driveHours
+        ? `Every pick must be within about a ${plan.radius.driveHours}-hour drive (~${plan.radius.miles} miles) of ${label}.`
+        : plan.radius?.miles
+          ? `Every pick must be within about ${plan.radius.miles} miles of ${label}.`
+          : `Anchor every pick near ${label}.`
+    );
+  }
+  lines.push("Include latitude and longitude on every item.");
+  return lines.join("\n");
+}
+
+/** Schema-level reminder sent alongside a recommendation request. */
+function recommendationOutputRequirements(plan, count) {
+  const parts = [
+    `Unless clarificationNeeded, items MUST contain exactly ${count} distinct kind=place entries.`,
+    "startTime, endTime and dayIndex MUST be null; dayLabel MUST be \"\".",
+    "No checklist, reminder, or flight items. No itinerary structure.",
+  ];
+  if (plan?.deliverable && plan.deliverable !== DELIVERABLES.MIXED_PLACES) {
+    parts.push(`Every item must be ${describeDeliverable(plan.deliverable)}.`);
+  }
+  if (plan?.geoScope === "origin_radius" && plan?.origin && plan?.radius) {
+    parts.push(
+      `Every item must be within ${plan.radius.miles} miles of ${plan.origin.latitude.toFixed(4)},${plan.origin.longitude.toFixed(4)} — items outside that range are rejected.`
+    );
+  } else if (plan?.radius) {
+    parts.push(`Every item must be within about ${plan.radius.miles} miles of the anchor named in the prompt.`);
+  }
+  parts.push("Every item MUST include latitude and longitude.");
+  return parts.join(" ");
+}
+
+/** Routing decisions echoed to the client so it can pick the right UI. */
+function describeRouting(plan, requestedMode, resolvedMode) {
+  return {
+    requestedMode,
+    resolvedMode,
+    geoScope: plan?.geoScope ?? null,
+    deliverable: plan?.deliverable ?? null,
+    isRecommendation: Boolean(plan?.isRecommendation),
+    origin: plan?.origin
+      ? {
+          label: plan.origin.label || "",
+          latitude: plan.origin.latitude,
+          longitude: plan.origin.longitude,
+          source: plan.origin.source,
+        }
+      : null,
+    radiusMiles: plan?.radius?.miles ?? null,
+    driveHours: plan?.radius?.driveHours ?? null,
+  };
+}
+
 /** True when the ask is clearly a single checklist / reminder / flight (not a list). */
 function isPlanDaySingleKindAsk(text) {
   const raw = safeString(text);
@@ -534,10 +1292,23 @@ function minPlaceFinderItemCount(text) {
 }
 
 /** Append an explicit multi-item count for place_finder / plan_day when the user didn't ask for N. */
-function enforceItemCount(text, mode) {
+function enforceItemCount(text, mode, plan = null) {
   const raw = safeString(text).trim();
   if (!raw) return raw;
   if (hasExplicitPlaceCount(raw)) return raw;
+
+  // A discovery ask on a day board is an options list, so don't demand a
+  // scheduled morning-to-night day with start and end times on every item.
+  if (mode === "plan_day" && plan?.isRecommendation) {
+    if (/return\s+\d+\s+distinct/i.test(raw)) return raw;
+    return (
+      `${raw}\n\n` +
+      `Return 8 distinct ${describeDeliverable(plan.deliverable)} as separate options. ` +
+      "Intent MUST be options_list — this is a list of choices, not a scheduled day. " +
+      "Leave startTime and endTime null unless a time is inherent to the ask, and add no " +
+      "checklists or reminders. One real venue per item with short notes."
+    );
+  }
 
   if (mode === "place_finder") {
     if (/return exactly\s+\d+\s+specific named places/i.test(raw)) return raw;
@@ -1090,14 +1861,16 @@ function redistributeCreateTripItems(items, dayCount) {
 function sanitizeItem(item, mode) {
   if (!item || typeof item !== "object") return null;
 
+  // Discovery modes return picks, never schedule rows.
+  const isPlaceMode = mode === "place_finder" || mode === "recommendations";
+
   // place_finder: model often emits kind=activity for restaurants — coerce, don't drop.
   let kind = safeString(item.kind).toLowerCase();
-  if (mode === "place_finder") {
+  if (isPlaceMode) {
     kind = "place";
   }
 
-  const allowedKinds =
-    mode === "place_finder" ? ["place"] : PLAN_DAY_KINDS;
+  const allowedKinds = isPlaceMode ? ["place"] : PLAN_DAY_KINDS;
   if (!allowedKinds.includes(kind)) return null;
 
   let dayIndex = coerceInt(item.dayIndex);
@@ -1129,7 +1902,11 @@ function sanitizeItem(item, mode) {
       : "",
   };
 
-  if (mode === "place_finder") {
+  const coordinate = normalizeCoordinate(item.latitude, item.longitude);
+  clean.latitude = coordinate?.latitude ?? null;
+  clean.longitude = coordinate?.longitude ?? null;
+
+  if (isPlaceMode) {
     clean.category = PLACE_FINDER_CATEGORIES.includes(item.category)
       ? item.category
       : "other";
@@ -1139,6 +1916,12 @@ function sanitizeItem(item, mode) {
     clean.endTime = null;
     clean.dayIndex = null;
     clean.dayLabel = "";
+  }
+
+  if (mode === "recommendations") {
+    const miles = finiteNumber(item.travelMilesFromOrigin);
+    clean.travelMilesFromOrigin = miles != null && miles >= 0 ? Math.round(miles) : null;
+    clean.travelTimeFromOrigin = safeString(item.travelTimeFromOrigin);
   }
 
   // Venue-like activities should keep a category for UI sectioning.
@@ -1295,6 +2078,22 @@ function closeTruncatedJSON(text) {
   return s;
 }
 
+// Exported for tests only; Vercel invokes the default export.
+export const __testables = {
+  DELIVERABLES,
+  resolveAskPlan,
+  resolveOrigin,
+  parseTravelRadius,
+  mentionsOrigin,
+  detectDeliverable,
+  wantsFullItinerary,
+  haversineMiles,
+  enforceTravelRadius,
+  originClarificationPrompt,
+  stripClientBoilerplate,
+  hasDiscoveryVerb,
+};
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1317,15 +2116,10 @@ export default async function handler(req, res) {
           : "plan_day";
 
     const rawUserText = safeString(body?.text ?? "").trim();
+    // The user's own prompt, free of any client-appended output boilerplate.
+    const askText =
+      safeString(body?.rawText ?? "").trim() || stripClientBoilerplate(rawUserText);
     const referenceDate = new Date();
-    const extractedDates =
-      mode === "create_trip"
-        ? extractTripDateRangeFromText(rawUserText, referenceDate)
-        : null;
-    const text =
-      mode === "create_trip"
-        ? enforceCreateTripDays(rawUserText, referenceDate, extractedDates)
-        : enforceItemCount(rawUserText, mode);
     const requestedPlaceCount = explicitPlaceCountValue(rawUserText);
     const facts = body?.facts ?? {};
     const tripContext = body?.tripContext ?? {};
@@ -1335,9 +2129,64 @@ export default async function handler(req, res) {
     const existingTrips = Array.isArray(body?.existingTrips) ? body.existingTrips : [];
     const scopeHint = body?.scopeHint ?? "";
 
+    // Read the ask before choosing a prompt: where to anchor the answer, and
+    // whether they want a planned trip or just a list of picks. The requested
+    // mode reflects which sheet was opened, which is not always the real ask.
+    const origin = resolveOrigin(body, tripContext);
+    const askPlan = resolveAskPlan({
+      mode,
+      text: askText,
+      tripContext,
+      origin,
+    });
+    const isRecommendation = askPlan.isRecommendation;
+    // Only create_trip needs rerouting: it is the mode that turns a discovery ask
+    // into a packed schedule. place_finder already returns picks, and plan_day has
+    // its own options_list intent that correctly stays kind=activity for a day
+    // board. Both of those just gain the geo anchoring below.
+    const usesRecommendationPrompt = isRecommendation && mode === "create_trip";
+    const resolvedMode = usesRecommendationPrompt ? "recommendations" : mode;
+
+    // "Within 5 hours of me" with no coordinates: ask where they are rather
+    // than inventing a region (which is how answers landed hundreds of miles off).
+    if (askPlan.needsOrigin) {
+      console.log(
+        JSON.stringify({
+          event: "origin_missing",
+          mode,
+          deliverable: askPlan.deliverable,
+          rawPreview: rawUserText.slice(0, 180),
+        })
+      );
+      return res.status(200).json({
+        intent: "clarification_needed",
+        clarificationNeeded: true,
+        clarificationPrompt: originClarificationPrompt(askPlan),
+        items: [],
+        ...(mode === "create_trip" ? { trip: null, alternatives: [] } : {}),
+        routing: describeRouting(askPlan, mode, resolvedMode),
+      });
+    }
+
+    const extractedDates =
+      mode === "create_trip" && !usesRecommendationPrompt
+        ? extractTripDateRangeFromText(rawUserText, referenceDate)
+        : null;
+
+    // Recommendation asks must never get itinerary-shaped prose appended —
+    // that is what turned "find cool spots" into a packed day-by-day plan.
+    const recommendationCount = usesRecommendationPrompt
+      ? Math.max(4, Math.min(askPlan.requestedCount ?? 10, 12))
+      : 0;
+    const text = usesRecommendationPrompt
+      ? enforceRecommendationAsk(askText, askPlan, recommendationCount)
+      : mode === "create_trip"
+        ? enforceCreateTripDays(rawUserText, referenceDate, extractedDates)
+        : enforceItemCount(rawUserText, mode, askPlan);
+
     // Structural item floors (schema minItems), not just prose.
     const createTripMinItems =
-      mode === "create_trip"
+      mode === "create_trip" && !usesRecommendationPrompt
         ? minCreateTripItemCount(
             extractedDates
               ? {
@@ -1354,22 +2203,29 @@ export default async function handler(req, res) {
     const placeFinderMinItems =
       mode === "place_finder" ? minPlaceFinderItemCount(rawUserText) : 0;
 
-    const systemInstruction =
-      mode === "place_finder"
-        ? buildPlaceFinderPrompt()
+    const recommendationPlan = { ...askPlan, requestedCount: recommendationCount };
+
+    const systemInstruction = usesRecommendationPrompt
+      ? buildRecommendationPrompt(recommendationPlan)
+      : mode === "place_finder"
+        ? buildPlaceFinderPrompt(askPlan)
         : mode === "create_trip"
           ? buildCreateTripPrompt()
-          : buildPlanDayPrompt();
+          : buildPlanDayPrompt(askPlan);
 
-    const responseSchema =
-      mode === "place_finder"
+    const responseSchema = usesRecommendationPrompt
+      ? buildRecommendationSchema(recommendationPlan, recommendationCount, {
+          includeTripShell: mode === "create_trip",
+        })
+      : mode === "place_finder"
         ? buildPlaceFinderSchema(placeFinderMinItems)
         : mode === "create_trip"
           ? buildCreateTripSchema(createTripMinItems)
           : buildPlanDaySchema(planDayMinItems);
 
-    const outputRequirements =
-      mode === "place_finder"
+    const outputRequirements = usesRecommendationPrompt
+      ? recommendationOutputRequirements(recommendationPlan, recommendationCount)
+      : mode === "place_finder"
         ? `Unless clarificationNeeded, items MUST contain exactly ${placeFinderMinItems} distinct kind=place venues` +
           (requestedPlaceCount != null
             ? ` (user asked for ${requestedPlaceCount}; schema-enforced). `
@@ -1395,7 +2251,7 @@ export default async function handler(req, res) {
             : undefined;
 
     const userMessage = {
-      mode,
+      mode: resolvedMode,
       text,
       referenceDate: toISODateOnly(referenceDate),
       ...(extractedDates
@@ -1403,6 +2259,29 @@ export default async function handler(req, res) {
             extractedTripDates: {
               startDate: extractedDates.startDate,
               endDate: extractedDates.endDate,
+            },
+          }
+        : {}),
+      // The resolved read of the ask, so the model sees the same conclusion
+      // the server used to pick this prompt and schema.
+      ask: {
+        geoScope: askPlan.geoScope,
+        deliverable: askPlan.deliverable,
+      },
+      ...(askPlan.origin
+        ? {
+            origin: {
+              label: askPlan.origin.label,
+              latitude: askPlan.origin.latitude,
+              longitude: askPlan.origin.longitude,
+            },
+          }
+        : {}),
+      ...(askPlan.radius
+        ? {
+            travelBudget: {
+              driveHours: askPlan.radius.driveHours,
+              maxMiles: askPlan.radius.miles,
             },
           }
         : {}),
@@ -1415,6 +2294,21 @@ export default async function handler(req, res) {
       existingTrips,
       ...(outputRequirements ? { outputRequirements } : {}),
     };
+
+    console.log(
+      JSON.stringify({
+        event: "ask_routing",
+        requestedMode: mode,
+        resolvedMode,
+        geoScope: askPlan.geoScope,
+        deliverable: askPlan.deliverable,
+        originSource: askPlan.origin?.source ?? null,
+        originLabel: askPlan.origin?.label ?? null,
+        radiusMiles: askPlan.radius?.miles ?? null,
+        driveHours: askPlan.radius?.driveHours ?? null,
+        rawPreview: rawUserText.slice(0, 180),
+      })
+    );
 
     if (mode === "create_trip") {
       console.log(
@@ -1457,7 +2351,7 @@ export default async function handler(req, res) {
       const temperature =
         typeof options.temperature === "number"
           ? options.temperature
-          : mode === "place_finder"
+          : resolvedMode === "place_finder" || resolvedMode === "recommendations"
             ? 0.7
             : 0.5;
       const schema = options.responseSchema || responseSchema;
@@ -1477,11 +2371,7 @@ export default async function handler(req, res) {
           generationConfig: {
             temperature,
             maxOutputTokens:
-              mode === "place_finder"
-                ? 8192
-                : mode === "create_trip"
-                  ? 32768
-                  : 8192,
+              resolvedMode === "create_trip" ? 32768 : 8192,
             responseMimeType: "application/json",
             responseSchema: schema,
           },
@@ -1550,15 +2440,20 @@ export default async function handler(req, res) {
     let firstCall = await callGemini(userMessage);
     // Gemini rejects oversized structured schemas with HTTP 400 in under a second
     // (surfaces as an error toast on 6+ day create_trip prompts). Retry without minItems.
-    if (
-      !firstCall.ok &&
-      (firstCall.status === 400 || firstCall.status === 422) &&
-      mode === "create_trip"
-    ) {
-      const relaxed = await callGemini(userMessage, {
-        responseSchema: buildCreateTripSchema(0),
-      });
-      if (relaxed.ok) firstCall = relaxed;
+    if (!firstCall.ok && (firstCall.status === 400 || firstCall.status === 422)) {
+      const relaxedSchema = usesRecommendationPrompt
+        ? buildRecommendationSchema(recommendationPlan, 0, {
+            includeTripShell: mode === "create_trip",
+          })
+        : mode === "create_trip"
+          ? buildCreateTripSchema(0)
+          : null;
+      if (relaxedSchema) {
+        const relaxed = await callGemini(userMessage, {
+          responseSchema: relaxedSchema,
+        });
+        if (relaxed.ok) firstCall = relaxed;
+      }
     }
     // Parse failure: retry once with a smaller, shorter payload (truncation / empty candidates).
     if (!firstCall.ok && firstCall.error === "Gemini returned no usable JSON") {
@@ -1579,10 +2474,14 @@ export default async function handler(req, res) {
             ? placeFinderMinItems
             : Math.min(placeFinderMinItems, 6)
           : 0;
+      const compactRecommendationMin = usesRecommendationPrompt
+        ? Math.min(recommendationCount, 6)
+        : 0;
       const compactMessage = {
         ...userMessage,
-        outputRequirements:
-          mode === "place_finder"
+        outputRequirements: usesRecommendationPrompt
+          ? `Return exactly ${compactRecommendationMin || 6} distinct kind=place picks with latitude and longitude. No schedule, no times. Keep notes under 12 words. Valid complete JSON only.`
+          : mode === "place_finder"
             ? `Return exactly ${compactPlaceMin || 6} distinct kind=place venues. Keep notes under 12 words. Valid complete JSON only.`
             : mode === "plan_day"
               ? compactPlanDayMin > 0
@@ -1593,8 +2492,13 @@ export default async function handler(req, res) {
                 : userMessage.outputRequirements,
       };
       const compactRetry = await callGemini(compactMessage, {
-        responseSchema:
-          mode === "create_trip"
+        responseSchema: usesRecommendationPrompt
+          ? buildRecommendationSchema(
+              recommendationPlan,
+              compactRecommendationMin || 6,
+              { includeTripShell: mode === "create_trip" }
+            )
+          : mode === "create_trip"
             ? buildCreateTripSchema(compactCreateMin || 10)
             : mode === "place_finder"
               ? buildPlaceFinderSchema(compactPlaceMin || 6)
@@ -1621,12 +2525,66 @@ export default async function handler(req, res) {
     // Truncated create_trip salvage often leaves only a hotel — force a recount retry.
     const truncatedCreateTrip =
       mode === "create_trip" &&
+      !usesRecommendationPrompt &&
       !result.clarificationNeeded &&
       (finishReason === "MAX_TOKENS" || finishReason === "LENGTH");
 
-    // place_finder / plan_day under-delivery: explicit N raises the retry bar (never suppresses it).
-    // Use the *original* user text for counts — enforceItemCount appends default prose.
-    if (mode === "place_finder" && !result.clarificationNeeded) {
+    // Recommendation under-delivery, plus picks the radius check threw out.
+    if (usesRecommendationPrompt && !result.clarificationNeeded) {
+      const inRange = enforceTravelRadius(result.items, askPlan);
+      if (inRange.dropped.length > 0) {
+        console.log(
+          JSON.stringify({
+            event: "radius_violation",
+            radiusMiles: askPlan.radius?.miles ?? null,
+            originLabel: askPlan.origin?.label ?? null,
+            dropped: inRange.dropped.slice(0, 12),
+          })
+        );
+      }
+      result = { ...result, items: inRange.items };
+
+      const priorCount = Array.isArray(result.items) ? result.items.length : 0;
+      const minAcceptable = Math.max(3, Math.floor(recommendationCount * 0.6));
+      if (priorCount < minAcceptable) {
+        const rejected = inRange.dropped
+          .map((d) => `${d.title} (~${d.miles} mi)`)
+          .join("; ");
+        const retryCall = await callGemini(
+          {
+            ...userMessage,
+            priorItemCount: priorCount,
+            ...(rejected
+              ? {
+                  rejectedForDistance: rejected,
+                }
+              : {}),
+            outputRequirements:
+              `Your previous answer only left ${priorCount} usable pick(s). That is invalid. ` +
+              (rejected
+                ? `These were REJECTED for being outside the travel radius — do not suggest them or anything else that far: ${rejected}. `
+                : "") +
+              `Return a COMPLETE new JSON response with exactly ${recommendationCount} distinct kind=place picks, each with latitude and longitude, all inside the radius. ` +
+              "No schedule, no times, no checklists. Do not apologize.",
+          },
+          {
+            temperature: 0.5,
+            responseSchema: buildRecommendationSchema(
+              recommendationPlan,
+              recommendationCount,
+              { includeTripShell: mode === "create_trip" }
+            ),
+          }
+        );
+        if (retryCall.ok && Array.isArray(retryCall.result.items)) {
+          const retryInRange = enforceTravelRadius(retryCall.result.items, askPlan);
+          if (retryInRange.items.length > priorCount) {
+            result = { ...retryCall.result, items: retryInRange.items };
+            finishReason = retryCall.finishReason ?? finishReason;
+          }
+        }
+      }
+    } else if (mode === "place_finder" && !result.clarificationNeeded) {
       const priorCount = Array.isArray(result.items) ? result.items.length : 0;
       const targetCount = placeFinderMinItems;
       const minAcceptable = requestedPlaceCount != null ? requestedPlaceCount : 8;
@@ -1687,7 +2645,11 @@ export default async function handler(req, res) {
         }
         // Keep the short first answer if the recount retry failed to parse.
       }
-    } else if (mode === "create_trip" && !result.clarificationNeeded) {
+    } else if (
+      mode === "create_trip" &&
+      !usesRecommendationPrompt &&
+      !result.clarificationNeeded
+    ) {
       // Thin drafts (especially Toronto) sometimes return only a hotel — refill with explicit slots.
       for (let attempt = 0; attempt < 2; attempt++) {
         if (
@@ -1762,6 +2724,36 @@ export default async function handler(req, res) {
       }
     }
 
+    const routing = describeRouting(askPlan, mode, resolvedMode);
+
+    if (usesRecommendationPrompt) {
+      const cleanedItems = (Array.isArray(result.items) ? result.items : [])
+        .map((item) => sanitizeItem(item, "recommendations"))
+        .filter(Boolean);
+
+      // create_trip callers treat a missing trip as a hard failure, so hand back
+      // a region-level shell. `routing` tells newer clients this is a pick list.
+      const tripShell =
+        mode === "create_trip"
+          ? {
+              ...sanitizeTripDraft(result.trip),
+              destination:
+                safeString(result.trip?.destination) ||
+                safeString(askPlan.origin?.label) ||
+                "",
+            }
+          : undefined;
+
+      return res.status(200).json({
+        intent: safeString(result.intent) || "place_discovery",
+        clarificationNeeded: Boolean(result.clarificationNeeded),
+        clarificationPrompt: result.clarificationPrompt ?? "",
+        items: cleanedItems,
+        ...(tripShell ? { trip: tripShell, alternatives: [] } : {}),
+        routing,
+      });
+    }
+
     if (mode === "create_trip") {
       if (!result.trip || typeof result.trip !== "object") {
         return res.status(502).json({ error: "Invalid Gemini JSON shape (missing trip)" });
@@ -1796,6 +2788,7 @@ export default async function handler(req, res) {
         trip,
         alternatives: [],
         items: cleanedItems,
+        routing,
       });
     }
 
@@ -1806,15 +2799,35 @@ export default async function handler(req, res) {
       });
     }
 
-    const cleanedItems = result.items
+    let cleanedItems = result.items
       .map((item) => sanitizeItem(item, mode))
       .filter(Boolean);
+
+    // A distance-bounded place_finder ask gets the same radius backstop.
+    if (mode === "place_finder") {
+      const inRange = enforceTravelRadius(cleanedItems, askPlan);
+      if (inRange.dropped.length > 0) {
+        console.log(
+          JSON.stringify({
+            event: "radius_violation",
+            mode,
+            radiusMiles: askPlan.radius?.miles ?? null,
+            dropped: inRange.dropped.slice(0, 12),
+          })
+        );
+      }
+      // Never empty the list on a bad batch — a far pick beats no answer.
+      if (inRange.items.length > 0) {
+        cleanedItems = inRange.items;
+      }
+    }
 
     return res.status(200).json({
       intent: result.intent ?? "unknown",
       clarificationNeeded: Boolean(result.clarificationNeeded),
       clarificationPrompt: result.clarificationPrompt ?? "",
       items: cleanedItems,
+      routing,
     });
   } catch (err) {
     return res.status(500).json({ error: String(err?.message || err) });
