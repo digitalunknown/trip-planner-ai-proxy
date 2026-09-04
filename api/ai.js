@@ -91,8 +91,11 @@ const BASE_REQUIRED = [
   "category",
 ];
 
-/** Coordinates are required wherever we filter by distance from an origin. */
-const GEO_REQUIRED = ["latitude", "longitude"];
+// Coordinates are deliberately NOT in any `required` list. Gemini rejects this
+// object schema with HTTP 400 ("Request contains an invalid argument") once
+// `required` grows while `minItems` is high — two extra required fields were
+// enough to break place_finder at minItems=10. Ask for them in the prompt
+// instead; enforceTravelRadius keeps items whose coordinates are missing.
 
 /** Static schema kept for reference; prefer buildPlanDaySchema(minItems). */
 const PLAN_DAY_SCHEMA = buildPlanDaySchema(0);
@@ -140,12 +143,7 @@ function buildPlaceFinderSchema(minItems = 0) {
         ...baseItemProperties(),
         category: { type: "string", enum: PLACE_FINDER_CATEGORIES },
       },
-      required: [
-        "kind",
-        "category",
-        ...BASE_REQUIRED.filter((k) => k !== "category"),
-        ...GEO_REQUIRED,
-      ],
+      required: ["kind", "category", ...BASE_REQUIRED.filter((k) => k !== "category")],
     },
   };
   if (floor > 0) {
@@ -218,12 +216,7 @@ function buildRecommendationSchema(plan, minItems = 0, { includeTripShell = fals
         travelMilesFromOrigin: { type: "number", nullable: true },
         travelTimeFromOrigin: { type: "string", nullable: true },
       },
-      required: [
-        "kind",
-        "category",
-        ...BASE_REQUIRED.filter((k) => k !== "category"),
-        ...GEO_REQUIRED,
-      ],
+      required: ["kind", "category", ...BASE_REQUIRED.filter((k) => k !== "category")],
     },
   };
   if (floor > 0) {
@@ -1080,10 +1073,12 @@ function detectDeliverable(text) {
     ],
   ];
 
-  for (const [deliverable, re] of tests) {
-    if (re.test(raw)) return deliverable;
-  }
-  return null;
+  const matched = tests.filter(([, re]) => re.test(raw)).map(([kind]) => kind);
+  if (matched.length === 0) return null;
+  // A deliberately broad ask ("mix restaurants, attractions, and stays") names
+  // several kinds — constraining it to whichever matched first would be wrong.
+  if (matched.length > 1) return DELIVERABLES.MIXED_PLACES;
+  return matched[0];
 }
 
 /**
@@ -2092,6 +2087,10 @@ export const __testables = {
   originClarificationPrompt,
   stripClientBoilerplate,
   hasDiscoveryVerb,
+  buildPlaceFinderSchema,
+  buildRecommendationSchema,
+  buildPlanDaySchema,
+  buildCreateTripSchema,
 };
 
 export default async function handler(req, res) {
@@ -2450,6 +2449,10 @@ export default async function handler(req, res) {
     let firstCall = await callGemini(userMessage);
     // Gemini rejects oversized structured schemas with HTTP 400 in under a second
     // (surfaces as an error toast on 6+ day create_trip prompts). Retry without minItems.
+    // Gemini rejects this object schema outright once `required` and `minItems`
+    // grow together, and it fails in under a second with only "invalid
+    // argument". Every mode retries without the item floor so a schema quirk
+    // degrades to a shorter answer instead of a failure toast.
     if (!firstCall.ok && (firstCall.status === 400 || firstCall.status === 422)) {
       const relaxedSchema = usesRecommendationPrompt
         ? buildRecommendationSchema(recommendationPlan, 0, {
@@ -2457,12 +2460,21 @@ export default async function handler(req, res) {
           })
         : mode === "create_trip"
           ? buildCreateTripSchema(0)
-          : null;
-      if (relaxedSchema) {
-        const relaxed = await callGemini(userMessage, {
-          responseSchema: relaxedSchema,
-        });
-        if (relaxed.ok) firstCall = relaxed;
+          : mode === "place_finder"
+            ? buildPlaceFinderSchema(0)
+            : buildPlanDaySchema(0);
+      const relaxed = await callGemini(userMessage, {
+        responseSchema: relaxedSchema,
+      });
+      if (relaxed.ok) {
+        console.warn(
+          JSON.stringify({
+            event: "schema_relaxed_after_400",
+            mode: resolvedMode,
+            droppedMinItems: true,
+          })
+        );
+        firstCall = relaxed;
       }
     }
     // Parse failure: retry once with a smaller, shorter payload (truncation / empty candidates).

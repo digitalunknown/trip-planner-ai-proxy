@@ -144,8 +144,18 @@ test("client-appended itinerary boilerplate does not skew the classifier", () =>
   assert.equal(p.deliverable, DELIVERABLES.DESTINATIONS);
   assert.equal(p.isRecommendation, true);
 
-  // Without stripping, "1 hotel" in the boilerplate hijacks the deliverable.
-  assert.equal(plan(sent, { origin: CHICAGO }).deliverable, DELIVERABLES.STAYS);
+  // Without stripping, the boilerplate's own "1 hotel, restaurants, activities"
+  // hijacks the deliverable away from the destinations the user asked for.
+  assert.notEqual(plan(sent, { origin: CHICAGO }).deliverable, DELIVERABLES.DESTINATIONS);
+});
+
+test("an ask naming several kinds stays mixed rather than picking one", () => {
+  // The Find Places "Best of {city}" chip sends exactly this.
+  const p = plan(
+    "Suggest 10 of the best places to save in Toronto — mix restaurants, attractions, and stays.",
+    { mode: "place_finder" }
+  );
+  assert.equal(p.deliverable, DELIVERABLES.MIXED_PLACES);
 });
 
 test("stripping leaves an ordinary prompt untouched", () => {
@@ -194,6 +204,37 @@ test("an internal refill prompt stays an itinerary", () => {
   const p = plan(refill, { origin: CHICAGO });
   assert.equal(p.deliverable, DELIVERABLES.FULL_ITINERARY);
   assert.equal(p.isRecommendation, false);
+});
+
+test("no schema requires coordinates", () => {
+  // Gemini 400s on this object schema once `required` grows alongside a high
+  // `minItems`. Adding latitude/longitude here broke Find Places entirely, so
+  // coordinates must stay optional in the schema and be asked for in the prompt.
+  const {
+    buildPlaceFinderSchema,
+    buildRecommendationSchema,
+    buildPlanDaySchema,
+    buildCreateTripSchema,
+  } = __testables;
+
+  const schemas = {
+    place_finder: buildPlaceFinderSchema(10),
+    recommendations: buildRecommendationSchema(
+      { deliverable: DELIVERABLES.DESTINATIONS },
+      10,
+      { includeTripShell: true }
+    ),
+    plan_day: buildPlanDaySchema(8),
+    create_trip: buildCreateTripSchema(8),
+  };
+
+  for (const [name, schema] of Object.entries(schemas)) {
+    const required = schema.properties.items.items.required;
+    assert.ok(!required.includes("latitude"), `${name} must not require latitude`);
+    assert.ok(!required.includes("longitude"), `${name} must not require longitude`);
+    // They must still be offered, or the model has no way to return them.
+    assert.ok(schema.properties.items.items.properties.latitude, `${name} should offer latitude`);
+  }
 });
 
 test("haversine sanity check", () => {
