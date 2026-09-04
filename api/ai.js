@@ -2380,6 +2380,16 @@ export default async function handler(req, res) {
 
       const upstreamText = await geminiRes.text();
       if (!geminiRes.ok) {
+        // An opaque upstream failure is very hard to diagnose after the fact,
+        // and schema rejections are the usual cause. Log what Gemini said.
+        console.error(
+          JSON.stringify({
+            event: "gemini_http_error",
+            mode: resolvedMode,
+            status: geminiRes.status,
+            upstream: String(upstreamText).slice(0, 900),
+          })
+        );
         return {
           ok: false,
           status: geminiRes.status,
@@ -2516,6 +2526,9 @@ export default async function handler(req, res) {
       }
       return res.status(firstCall.status).json({
         error: "Upstream AI request failed",
+        // Upstream schema/validation text — no secrets, and the only way to
+        // tell a bad schema from a quota problem without shell access to logs.
+        detail: String(firstCall.body ?? "").slice(0, 600),
       });
     }
 
