@@ -1,3 +1,12 @@
+import {
+  buildServices,
+  authenticateRequest,
+  structuredRateLimitError,
+  structuredQuotaError,
+  structuredSpendLimitError,
+  responseWithStructuredError,
+} from "../lib/auth.js";
+import { loadConfig } from "../lib/config.js";
 /**
  * TripStacks AI backend — POST /api/ai
  *
@@ -2099,6 +2108,9 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  const services = buildServices();
+  const { cfg, rl, quota, spend } = services;
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: "Missing GEMINI_API_KEY" });
@@ -2106,6 +2118,7 @@ export default async function handler(req, res) {
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body ?? {};
+    const auth = await authenticateRequest(req, services);
 
     const mode =
       body?.mode === "place_finder"
@@ -2145,6 +2158,92 @@ export default async function handler(req, res) {
     // board. Both of those just gain the geo anchoring below.
     const usesRecommendationPrompt = isRecommendation && mode === "create_trip";
     const resolvedMode = usesRecommendationPrompt ? "recommendations" : mode;
+
+    // Rate limiting — log/off modes fail-open with a would_block event; enforce blocks.
+    try {
+      const rlCheck = await rl.check({ keyId: auth.keyId, ip: auth.ip });
+      if (!rlCheck.ok) {
+        if (cfg.authMode === "enforce") {
+          return responseWithStructuredError(
+            res,
+            structuredRateLimitError({
+              scope: rlCheck.blockedScope,
+              retryAfterSeconds: rlCheck.retryAfterSeconds,
+              remaining: rlCheck.details.map((d) => ({
+                scope: d.scope,
+                remaining: Math.max(0, d.limit - d.count),
+                limit: d.limit,
+              })),
+            })
+          );
+        } else {
+          console.log(
+            JSON.stringify({
+              event: "would_block",
+              kind: "rate_limit",
+              scope: rlCheck.blockedScope,
+              retryAfterSeconds: rlCheck.retryAfterSeconds,
+              authMode: cfg.authMode,
+            })
+          );
+        }
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ event: "kv_error", where: "rl.check", error: String(e) }));
+      // fail-open
+    }
+    // Global spend breaker — log/off modes only warn.
+    try {
+      const spendOk = await spend.canSpend({});
+      if (!spendOk.ok) {
+        if (cfg.authMode === "enforce") {
+          return responseWithStructuredError(
+            res,
+            structuredSpendLimitError({ used: spendOk.used, limit: spendOk.limit })
+          );
+        } else {
+          console.log(
+            JSON.stringify({
+              event: "would_block",
+              kind: "spend_limit",
+              used: spendOk.used,
+              limit: spendOk.limit,
+              authMode: cfg.authMode,
+            })
+          );
+        }
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ event: "kv_error", where: "spend.canSpend", error: String(e) }));
+      // fail-open
+    }
+    // Auth and quota gate per app/device
+    if (cfg.authMode === "enforce") {
+      if (!auth.keyId) {
+        return res.status(401).json({ error: "unauthorized", detail: "token_missing" });
+      }
+      try {
+        const pre = await quota.precheck({
+          keyId: auth.keyId,
+          tier: auth.tier,
+          mode: resolvedMode,
+        });
+        if (!pre.ok) {
+          return responseWithStructuredError(
+            res,
+            structuredQuotaError({
+              tier: auth.tier,
+              cost: pre.cost,
+              balance: pre.balance,
+              keyId: auth.keyId,
+            })
+          );
+        }
+      } catch (e) {
+        console.log(JSON.stringify({ event: "kv_error", where: "quota.precheck", error: String(e) }));
+        // fail-open
+      }
+    }
 
     // "Within 5 hours of me" with no coordinates: ask where they are rather
     // than inventing a region (which is how answers landed hundreds of miles off).
@@ -2426,6 +2525,30 @@ export default async function handler(req, res) {
           textLength: String(candidateText).length,
         })
       );
+      // Emit usage metrics for COGS visibility
+      const usage = geminiJSON?.usageMetadata || null;
+      if (usage) {
+        const estUsd = spend.estimateUsd({ model, usageMetadata: usage });
+        console.log(
+          JSON.stringify({
+            event: "gemini_usage",
+            keyId: auth.keyId || null,
+            tier: auth.tier || "free",
+            mode: resolvedMode,
+            model,
+            usage,
+            estUsd,
+          })
+        );
+        // Update spend meter (best-effort)
+        try {
+          await spend.addSpend(estUsd, {});
+        } catch (e) {
+          console.log(
+            JSON.stringify({ event: "kv_error", where: "spend.addSpend", error: String(e) })
+          );
+        }
+      }
       if (!parsed || typeof parsed !== "object") {
         // Do not echo the raw model payload to clients (can be huge).
         console.error("Gemini returned no usable JSON", {
@@ -2443,7 +2566,7 @@ export default async function handler(req, res) {
           blockReason,
         };
       }
-      return { ok: true, result: parsed, finishReason };
+      return { ok: true, result: parsed, finishReason, usage: geminiJSON?.usageMetadata || null };
     }
 
     let firstCall = await callGemini(userMessage);
@@ -2546,6 +2669,9 @@ export default async function handler(req, res) {
 
     let result = firstCall.result;
     let finishReason = firstCall.finishReason ?? null;
+    // Finalize intended charge mode after we know if clarification was needed
+    const effectiveMode =
+      result?.clarificationNeeded === true ? "clarification" : resolvedMode;
 
     // Truncated create_trip salvage often leaves only a hotel — force a recount retry.
     const truncatedCreateTrip =
@@ -2845,6 +2971,28 @@ export default async function handler(req, res) {
       if (inRange.items.length > 0) {
         cleanedItems = inRange.items;
       }
+    }
+
+    // Quota consumption after success (enforce mode only; clarification is free)
+    if (cfg.authMode === "enforce" && auth.keyId) {
+      const consumed = await quota.consume({
+        keyId: auth.keyId,
+        tier: auth.tier,
+        mode: effectiveMode,
+      });
+      if (!consumed.ok) {
+        return responseWithStructuredError(
+          res,
+          structuredQuotaError({
+            tier: auth.tier,
+            cost: consumed.cost,
+            balance: consumed.balance,
+            keyId: auth.keyId,
+          })
+        );
+      }
+      res.setHeader("X-Credits-Remaining", String(consumed.remaining));
+      res.setHeader("X-Credits-Reset-At", new Date(consumed.resetAt).toISOString());
     }
 
     return res.status(200).json({
