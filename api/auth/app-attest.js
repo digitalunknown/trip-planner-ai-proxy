@@ -48,12 +48,17 @@ export default async function handler(req, res) {
       appleTxnSeen: Boolean(appleTransactionJws),
     };
     // Persist with a long shelf life; quotas and tokens are separate entries.
-    await store.set(`attest:${keyId}`, JSON.stringify(attestedKey), {
-      exSeconds: 90 * 24 * 3600, // ~90 days
-    });
+    try {
+      await store.set(`attest:${keyId}`, JSON.stringify(attestedKey), {
+        exSeconds: 90 * 24 * 3600, // ~90 days
+      });
+    } catch {
+      // Fail-open: do not block token issuance on KV errors
+    }
 
-    // Decide tier = plus when a valid StoreKit transaction is provided (verified later).
-    const tier = appleTransactionJws ? "plus" : "free";
+    // Tier comes ONLY from a verified token. Do NOT trust a JWS string.
+    // TODO: Add real StoreKit server verification and map valid entitlements to "plus".
+    const tier = "free";
     const token = issueAppToken({
       keyId,
       tier,
