@@ -2159,50 +2159,89 @@ export default async function handler(req, res) {
     const usesRecommendationPrompt = isRecommendation && mode === "create_trip";
     const resolvedMode = usesRecommendationPrompt ? "recommendations" : mode;
 
-    // Rate limiting (always enforced)
-    const rlCheck = await rl.check({ keyId: auth.keyId, ip: auth.ip });
-    if (!rlCheck.ok) {
-      return responseWithStructuredError(
-        res,
-        structuredRateLimitError({
-          scope: rlCheck.blockedScope,
-          retryAfterSeconds: rlCheck.retryAfterSeconds,
-          remaining: rlCheck.details.map((d) => ({
-            scope: d.scope,
-            remaining: Math.max(0, d.limit - d.count),
-            limit: d.limit,
-          })),
-        })
-      );
+    // Rate limiting — log/off modes fail-open with a would_block event; enforce blocks.
+    try {
+      const rlCheck = await rl.check({ keyId: auth.keyId, ip: auth.ip });
+      if (!rlCheck.ok) {
+        if (cfg.authMode === "enforce") {
+          return responseWithStructuredError(
+            res,
+            structuredRateLimitError({
+              scope: rlCheck.blockedScope,
+              retryAfterSeconds: rlCheck.retryAfterSeconds,
+              remaining: rlCheck.details.map((d) => ({
+                scope: d.scope,
+                remaining: Math.max(0, d.limit - d.count),
+                limit: d.limit,
+              })),
+            })
+          );
+        } else {
+          console.log(
+            JSON.stringify({
+              event: "would_block",
+              kind: "rate_limit",
+              scope: rlCheck.blockedScope,
+              retryAfterSeconds: rlCheck.retryAfterSeconds,
+              authMode: cfg.authMode,
+            })
+          );
+        }
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ event: "kv_error", where: "rl.check", error: String(e) }));
+      // fail-open
     }
-    // Global spend breaker
-    const spendOk = await spend.canSpend({});
-    if (!spendOk.ok) {
-      return responseWithStructuredError(
-        res,
-        structuredSpendLimitError({ used: spendOk.used, limit: spendOk.limit })
-      );
+    // Global spend breaker — log/off modes only warn.
+    try {
+      const spendOk = await spend.canSpend({});
+      if (!spendOk.ok) {
+        if (cfg.authMode === "enforce") {
+          return responseWithStructuredError(
+            res,
+            structuredSpendLimitError({ used: spendOk.used, limit: spendOk.limit })
+          );
+        } else {
+          console.log(
+            JSON.stringify({
+              event: "would_block",
+              kind: "spend_limit",
+              used: spendOk.used,
+              limit: spendOk.limit,
+              authMode: cfg.authMode,
+            })
+          );
+        }
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ event: "kv_error", where: "spend.canSpend", error: String(e) }));
+      // fail-open
     }
     // Auth and quota gate per app/device
     if (cfg.authMode === "enforce") {
       if (!auth.keyId) {
         return res.status(401).json({ error: "unauthorized", detail: "token_missing" });
       }
-      const pre = await quota.precheck({
-        keyId: auth.keyId,
-        tier: auth.tier,
-        mode: resolvedMode,
-      });
-      if (!pre.ok) {
-        return responseWithStructuredError(
-          res,
-          structuredQuotaError({
-            tier: auth.tier,
-            cost: pre.cost,
-            balance: pre.balance,
-            keyId: auth.keyId,
-          })
-        );
+      try {
+        const pre = await quota.precheck({
+          keyId: auth.keyId,
+          tier: auth.tier,
+          mode: resolvedMode,
+        });
+        if (!pre.ok) {
+          return responseWithStructuredError(
+            res,
+            structuredQuotaError({
+              tier: auth.tier,
+              cost: pre.cost,
+              balance: pre.balance,
+              keyId: auth.keyId,
+            })
+          );
+        }
+      } catch (e) {
+        console.log(JSON.stringify({ event: "kv_error", where: "quota.precheck", error: String(e) }));
+        // fail-open
       }
     }
 
@@ -2502,7 +2541,13 @@ export default async function handler(req, res) {
           })
         );
         // Update spend meter (best-effort)
-        await spend.addSpend(estUsd, {});
+        try {
+          await spend.addSpend(estUsd, {});
+        } catch (e) {
+          console.log(
+            JSON.stringify({ event: "kv_error", where: "spend.addSpend", error: String(e) })
+          );
+        }
       }
       if (!parsed || typeof parsed !== "object") {
         // Do not echo the raw model payload to clients (can be huge).
